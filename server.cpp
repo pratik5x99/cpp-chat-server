@@ -5,28 +5,29 @@
 #include <string.h>      // For memset function
 #include <thread>        // For using std::thread for multi-threading
 #include <vector>        // To store client sockets
-#include <mutex>         // To protect shared data (the client list)
-#include <algorithm>     // For std::find to remove elements from vector
+#include <mutex>         // To protect shared data
+#include <algorithm>     // For std::find
+#include <map>           // To map client sockets to usernames
 
 #define PORT 8080
 
 // --- Shared Resources ---
-// Vector to store the socket file descriptors of all connected clients.
+// We need to protect both the list of clients and the map of usernames.
+// One mutex is sufficient for both.
+std::mutex shared_resources_mutex; 
 std::vector<int> clients; 
-// Mutex to protect access to the shared 'clients' vector.
-std::mutex clients_mutex; 
+std::map<int, std::string> client_usernames;
 
 /**
- * @brief Broadcasts a message to all clients except the sender.
+ * @brief Broadcasts a message to all connected clients.
  * @param message The message string to be sent.
- * @param sender_socket The socket of the client who sent the message.
+ * @param sender_socket The socket of the client who sent the message (optional, 0 to send to all).
  */
-void broadcast_message(const std::string& message, int sender_socket) {
-    // Lock the mutex to ensure exclusive access to the clients vector.
-    std::lock_guard<std::mutex> guard(clients_mutex);
+void broadcast_message(const std::string& message, int sender_socket = 0) {
+    std::lock_guard<std::mutex> guard(shared_resources_mutex);
 
     for (int client_socket : clients) {
-        // Send the message to every client that is NOT the sender.
+        // Send the message to every client that is NOT the sender
         if (client_socket != sender_socket) {
             write(client_socket, message.c_str(), message.length());
         }
@@ -38,44 +39,66 @@ void broadcast_message(const std::string& message, int sender_socket) {
  * @param client_socket The socket file descriptor for the connected client.
  */
 void handle_client(int client_socket) {
-    // Add the new client to our list of clients.
-    {
-        std::lock_guard<std::mutex> guard(clients_mutex);
-        clients.push_back(client_socket);
-    }
-
-    // Create a welcome message with the client's ID (their socket number)
-    std::string welcome_msg = "Welcome! You are Client #" + std::to_string(client_socket) + "\n";
-    write(client_socket, welcome_msg.c_str(), welcome_msg.length());
-
     char buffer[1024];
+    std::string username;
 
-    // Loop to continuously read messages from this client
+    // --- 1. Get Username ---
+    // Prompt client for their username
+    write(client_socket, "Please enter your username: ", 28);
+    memset(buffer, 0, 1024);
+    int bytes_read = read(client_socket, buffer, 1024);
+    if (bytes_read <= 0) {
+        std::cout << "Client failed to provide username. Disconnecting." << std::endl;
+        close(client_socket);
+        return;
+    }
+    // Remove newline character from username if present
+    username = std::string(buffer, bytes_read);
+    username.erase(std::remove(username.begin(), username.end(), '\n'), username.end());
+    username.erase(std::remove(username.begin(), username.end(), '\r'), username.end());
+
+
+    // --- 2. Add client to shared resources and announce entry ---
+    {
+        std::lock_guard<std::mutex> guard(shared_resources_mutex);
+        clients.push_back(client_socket);
+        client_usernames[client_socket] = username;
+    }
+    
+    std::string join_msg = "[Server]: " + username + " has joined the chat.\n";
+    std::cout << join_msg;
+    broadcast_message(join_msg, client_socket); // Announce to others
+
+    // --- 3. Main Chat Loop ---
     while (true) {
         memset(buffer, 0, 1024);
-        int bytes_read = read(client_socket, buffer, 1024);
+        bytes_read = read(client_socket, buffer, 1024);
 
-        // If read() returns 0 or less, the client has disconnected.
         if (bytes_read <= 0) {
-            std::cout << "Client #" << client_socket << " disconnected." << std::endl;
-            break; // Exit the loop
+            // Client has disconnected
+            break; 
         }
 
-        // Format the message to be broadcasted
-        std::string message = "[Client #" + std::to_string(client_socket) + "]: " + buffer;
+        // Format the message with the username
+        std::string message = "[" + username + "]: " + std::string(buffer);
         std::cout << message; // Log message to server console
         
         // Broadcast the message to all other clients
         broadcast_message(message, client_socket);
     }
 
-    // --- Cleanup for disconnected client ---
+    // --- 4. Cleanup for disconnected client ---
+    // Announce departure
+    std::string leave_msg = "[Server]: " + username + " has left the chat.\n";
+    std::cout << leave_msg;
+    broadcast_message(leave_msg, client_socket);
+
+    // Remove client from shared resources
     {
-        std::lock_guard<std::mutex> guard(clients_mutex);
-        // Find the disconnected client in the vector
+        std::lock_guard<std::mutex> guard(shared_resources_mutex);
+        client_usernames.erase(client_socket);
         auto it = std::find(clients.begin(), clients.end(), client_socket);
         if (it != clients.end()) {
-            // Remove it from the vector
             clients.erase(it);
         }
     }
@@ -117,7 +140,7 @@ int main() {
             continue;
         }
 
-        std::cout << "New client connected: #" << client_socket << std::endl;
+        std::cout << "New client connection accepted." << std::endl;
         std::thread client_thread(handle_client, client_socket);
         client_thread.detach(); 
     }
