@@ -8,12 +8,11 @@
 #include <mutex>         // To protect shared data
 #include <algorithm>     // For std::find
 #include <map>           // To map client sockets to usernames
+#include <sstream>       // For parsing strings
 
 #define PORT 8080
 
 // --- Shared Resources ---
-// We need to protect both the list of clients and the map of usernames.
-// One mutex is sufficient for both.
 std::mutex shared_resources_mutex; 
 std::vector<int> clients; 
 std::map<int, std::string> client_usernames;
@@ -27,12 +26,46 @@ void broadcast_message(const std::string& message, int sender_socket = 0) {
     std::lock_guard<std::mutex> guard(shared_resources_mutex);
 
     for (int client_socket : clients) {
-        // Send the message to every client that is NOT the sender
         if (client_socket != sender_socket) {
             write(client_socket, message.c_str(), message.length());
         }
     }
 }
+
+/**
+ * @brief Sends a private message from one user to another.
+ * @param message The message content.
+ * @param sender_username The username of the person sending the message.
+ * @param recipient_username The username of the intended recipient.
+ * @param sender_socket The socket of the sender, to send confirmations/errors back.
+ */
+void send_private_message(const std::string& message, const std::string& sender_username, const std::string& recipient_username, int sender_socket) {
+    std::lock_guard<std::mutex> guard(shared_resources_mutex);
+
+    int recipient_socket = -1;
+    // Find the recipient's socket by iterating through the map.
+    for (auto const& pair : client_usernames) {
+        if (pair.second == recipient_username) {
+            recipient_socket = pair.first;
+            break;
+        }
+    }
+
+    if (recipient_socket != -1) {
+        // Recipient was found, format and send the private message.
+        std::string pm_to_send = "[Private from " + sender_username + "]: " + message;
+        write(recipient_socket, pm_to_send.c_str(), pm_to_send.length());
+
+        // Send a confirmation message back to the sender.
+        std::string confirmation_msg = "[Server]: Your private message to " + recipient_username + " has been sent.\n";
+        write(sender_socket, confirmation_msg.c_str(), confirmation_msg.length());
+    } else {
+        // Recipient was not found.
+        std::string error_msg = "[Server]: User '" + recipient_username + "' not found or is offline.\n";
+        write(sender_socket, error_msg.c_str(), error_msg.length());
+    }
+}
+
 
 /**
  * @brief Handles all communication for a single client in a dedicated thread.
@@ -42,8 +75,6 @@ void handle_client(int client_socket) {
     char buffer[1024];
     std::string username;
 
-    // --- 1. Get Username ---
-    // Prompt client for their username
     write(client_socket, "Please enter your username: ", 28);
     memset(buffer, 0, 1024);
     int bytes_read = read(client_socket, buffer, 1024);
@@ -52,13 +83,10 @@ void handle_client(int client_socket) {
         close(client_socket);
         return;
     }
-    // Remove newline character from username if present
     username = std::string(buffer, bytes_read);
     username.erase(std::remove(username.begin(), username.end(), '\n'), username.end());
     username.erase(std::remove(username.begin(), username.end(), '\r'), username.end());
 
-
-    // --- 2. Add client to shared resources and announce entry ---
     {
         std::lock_guard<std::mutex> guard(shared_resources_mutex);
         clients.push_back(client_socket);
@@ -67,33 +95,62 @@ void handle_client(int client_socket) {
     
     std::string join_msg = "[Server]: " + username + " has joined the chat.\n";
     std::cout << join_msg;
-    broadcast_message(join_msg, client_socket); // Announce to others
+    broadcast_message(join_msg, client_socket);
 
-    // --- 3. Main Chat Loop ---
+    // --- NEW: Send welcome and help message to the new client ---
+    std::string help_msg = "\nWelcome to the chat, " + username + "!\n"
+                           "----------------------------------------\n"
+                           "To send a public message, just type and press Enter.\n"
+                           "To send a private message, use: /msg <username> <message>\n"
+                           "To leave the chat, use: /quit\n"
+                           "----------------------------------------\n\n";
+    write(client_socket, help_msg.c_str(), help_msg.length());
+
+
     while (true) {
         memset(buffer, 0, 1024);
         bytes_read = read(client_socket, buffer, 1024);
 
         if (bytes_read <= 0) {
-            // Client has disconnected
             break; 
         }
 
-        // Format the message with the username
-        std::string message = "[" + username + "]: " + std::string(buffer);
-        std::cout << message; // Log message to server console
+        std::string received_msg(buffer, bytes_read);
         
-        // Broadcast the message to all other clients
-        broadcast_message(message, client_socket);
+        if (received_msg.rfind("/quit", 0) == 0) {
+            break;
+        }
+        
+        if (received_msg.rfind("/msg", 0) == 0) {
+            std::stringstream ss(received_msg);
+            std::string command, recipient, private_message;
+            
+            ss >> command;
+            ss >> recipient;
+            
+            std::getline(ss, private_message);
+            size_t first_char = private_message.find_first_not_of(" \t");
+            if (std::string::npos != first_char) {
+                private_message = private_message.substr(first_char);
+            }
+
+            if (!recipient.empty() && !private_message.empty()) {
+                send_private_message(private_message + "\n", username, recipient, client_socket);
+            } else {
+                std::string usage_msg = "[Server]: Usage: /msg <username> <message>\n";
+                write(client_socket, usage_msg.c_str(), usage_msg.length());
+            }
+        } else {
+            std::string message = "[" + username + "]: " + received_msg;
+            std::cout << message;
+            broadcast_message(message, client_socket);
+        }
     }
 
-    // --- 4. Cleanup for disconnected client ---
-    // Announce departure
     std::string leave_msg = "[Server]: " + username + " has left the chat.\n";
     std::cout << leave_msg;
     broadcast_message(leave_msg, client_socket);
 
-    // Remove client from shared resources
     {
         std::lock_guard<std::mutex> guard(shared_resources_mutex);
         client_usernames.erase(client_socket);
@@ -112,6 +169,13 @@ int main() {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         std::cerr << "Error: Socket creation failed." << std::endl;
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        std::cerr << "Error: setsockopt failed." << std::endl;
+        close(server_fd);
         return -1;
     }
 
