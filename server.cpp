@@ -66,26 +66,48 @@ void send_private_message(const std::string& message, const std::string& sender_
     }
 }
 
+/**
+ * @brief Reads a full line (ending in '\n') from a socket.
+ * This handles clients that send data character-by-character (like Telnet).
+ * @param client_socket The socket to read from.
+ * @param out_line The string to store the resulting line.
+ * @return bool True if a line was read successfully, false if the client disconnected.
+ */
+bool read_line_from_client(int client_socket, std::string& out_line) {
+    out_line = "";
+    char buffer;
+    int bytes_read;
+
+    while ((bytes_read = read(client_socket, &buffer, 1)) > 0) {
+        if (buffer == '\n') {
+            break; // End of line
+        }
+        // --- NEW: Handle backspace characters ---
+        if (buffer == '\b' || buffer == '\x7f') { // Check for backspace (BS) or delete (DEL)
+            if (!out_line.empty()) {
+                out_line.pop_back();
+            }
+        } else if (buffer != '\r') { // Ignore carriage return
+            out_line += buffer;
+        }
+    }
+    return bytes_read > 0;
+}
+
 
 /**
  * @brief Handles all communication for a single client in a dedicated thread.
  * @param client_socket The socket file descriptor for the connected client.
  */
 void handle_client(int client_socket) {
-    char buffer[1024];
     std::string username;
 
     write(client_socket, "Please enter your username: ", 28);
-    memset(buffer, 0, 1024);
-    int bytes_read = read(client_socket, buffer, 1024);
-    if (bytes_read <= 0) {
+    if (!read_line_from_client(client_socket, username)) {
         std::cout << "Client failed to provide username. Disconnecting." << std::endl;
         close(client_socket);
         return;
     }
-    username = std::string(buffer, bytes_read);
-    username.erase(std::remove(username.begin(), username.end(), '\n'), username.end());
-    username.erase(std::remove(username.begin(), username.end(), '\r'), username.end());
 
     {
         std::lock_guard<std::mutex> guard(shared_resources_mutex);
@@ -97,7 +119,6 @@ void handle_client(int client_socket) {
     std::cout << join_msg;
     broadcast_message(join_msg, client_socket);
 
-    // --- NEW: Send welcome and help message to the new client ---
     std::string help_msg = "\nWelcome to the chat, " + username + "!\n"
                            "----------------------------------------\n"
                            "To send a public message, just type and press Enter.\n"
@@ -106,18 +127,9 @@ void handle_client(int client_socket) {
                            "----------------------------------------\n\n";
     write(client_socket, help_msg.c_str(), help_msg.length());
 
-
-    while (true) {
-        memset(buffer, 0, 1024);
-        bytes_read = read(client_socket, buffer, 1024);
-
-        if (bytes_read <= 0) {
-            break; 
-        }
-
-        std::string received_msg(buffer, bytes_read);
-        
-        if (received_msg.rfind("/quit", 0) == 0) {
+    std::string received_msg;
+    while (read_line_from_client(client_socket, received_msg)) {
+        if (received_msg == "/quit") {
             break;
         }
         
@@ -141,7 +153,7 @@ void handle_client(int client_socket) {
                 write(client_socket, usage_msg.c_str(), usage_msg.length());
             }
         } else {
-            std::string message = "[" + username + "]: " + received_msg;
+            std::string message = "[" + username + "]: " + received_msg + "\n";
             std::cout << message;
             broadcast_message(message, client_socket);
         }
