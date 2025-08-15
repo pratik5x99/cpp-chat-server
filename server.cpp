@@ -82,7 +82,6 @@ bool read_line_from_client(int client_socket, std::string& out_line) {
         if (buffer == '\n') {
             break; // End of line
         }
-        // --- NEW: Handle backspace characters ---
         if (buffer == '\b' || buffer == '\x7f') { // Check for backspace (BS) or delete (DEL)
             if (!out_line.empty()) {
                 out_line.pop_back();
@@ -102,11 +101,33 @@ bool read_line_from_client(int client_socket, std::string& out_line) {
 void handle_client(int client_socket) {
     std::string username;
 
-    write(client_socket, "Please enter your username: ", 28);
-    if (!read_line_from_client(client_socket, username)) {
-        std::cout << "Client failed to provide username. Disconnecting." << std::endl;
-        close(client_socket);
-        return;
+    // --- NEW: Loop to get a unique username ---
+    while (true) {
+        write(client_socket, "Please enter your username: ", 28);
+        if (!read_line_from_client(client_socket, username) || username.empty()) {
+            std::cout << "Client failed to provide username. Disconnecting." << std::endl;
+            close(client_socket);
+            return;
+        }
+
+        bool name_taken = false;
+        // Lock the mutex to safely check for duplicates
+        {
+            std::lock_guard<std::mutex> guard(shared_resources_mutex);
+            for (auto const& pair : client_usernames) {
+                if (pair.second == username) {
+                    name_taken = true;
+                    break;
+                }
+            }
+        }
+
+        if (name_taken) {
+            write(client_socket, "[Server]: Username is already taken. Please try another. \n ", 56);
+        } else {
+            // Username is unique, break the loop
+            break;
+        }
     }
 
     {
