@@ -101,7 +101,6 @@ bool read_line_from_client(int client_socket, std::string& out_line) {
 void handle_client(int client_socket) {
     std::string username;
 
-    // --- NEW: Loop to get a unique username ---
     while (true) {
         write(client_socket, "Please enter your username: ", 28);
         if (!read_line_from_client(client_socket, username) || username.empty()) {
@@ -111,7 +110,6 @@ void handle_client(int client_socket) {
         }
 
         bool name_taken = false;
-        // Lock the mutex to safely check for duplicates
         {
             std::lock_guard<std::mutex> guard(shared_resources_mutex);
             for (auto const& pair : client_usernames) {
@@ -123,9 +121,8 @@ void handle_client(int client_socket) {
         }
 
         if (name_taken) {
-            write(client_socket, "[Server]: Username is already taken. Please try another. \n ", 56);
+            write(client_socket, "[Server]: Username is already taken. Please try another.\n", 55);
         } else {
-            // Username is unique, break the loop
             break;
         }
     }
@@ -140,12 +137,16 @@ void handle_client(int client_socket) {
     std::cout << join_msg;
     broadcast_message(join_msg, client_socket);
 
-    std::string help_msg = "\nWelcome to the chat, " + username + "!\n"
-                           "----------------------------------------\n"
-                           "To send a public message, just type and press Enter.\n"
-                           "To send a private message, use: /msg <username> <message>\n"
-                           "To leave the chat, use: /quit\n"
-                           "----------------------------------------\n\n";
+    // --- NEW: Expanded welcome message with rules ---
+    std::string help_msg = "\nWelcome to the C++ Chat Server, " + username + "!\n"
+                           "========================================\n"
+                           "Server Rules: Be respectful to others.\n\n"
+                           "Commands:\n"
+                           "  - To send a public message, just type and press Enter.\n"
+                           "  - To send a private message: /msg <username> <message>\n"
+                           "  - To see who is online: /list\n"
+                           "  - To leave the chat: /quit\n"
+                           "========================================\n\n";
     write(client_socket, help_msg.c_str(), help_msg.length());
 
     std::string received_msg;
@@ -153,8 +154,18 @@ void handle_client(int client_socket) {
         if (received_msg == "/quit") {
             break;
         }
-        
-        if (received_msg.rfind("/msg", 0) == 0) {
+        // --- NEW: Handle /list command ---
+        else if (received_msg == "/list") {
+            std::string user_list_msg = "[Server]: Users currently online:\n";
+            {
+                std::lock_guard<std::mutex> guard(shared_resources_mutex);
+                for (auto const& pair : client_usernames) {
+                    user_list_msg += " - " + pair.second + "\n";
+                }
+            }
+            write(client_socket, user_list_msg.c_str(), user_list_msg.length());
+        }
+        else if (received_msg.rfind("/msg", 0) == 0) {
             std::stringstream ss(received_msg);
             std::string command, recipient, private_message;
             
