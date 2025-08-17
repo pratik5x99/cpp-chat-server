@@ -9,6 +9,8 @@
 #include <algorithm>     // For std::find
 #include <map>           // To map client sockets to usernames
 #include <sstream>       // For parsing strings
+#include <chrono>        // For getting the current time
+#include <iomanip>       // For formatting the time
 
 #define PORT 8080
 
@@ -16,6 +18,18 @@
 std::mutex shared_resources_mutex; 
 std::vector<int> clients; 
 std::map<int, std::string> client_usernames;
+
+/**
+ * @brief Gets the current time formatted as [HH:MM].
+ * @return A string with the formatted current time.
+ */
+std::string get_current_time() {
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "[%H:%M]");
+    return ss.str();
+}
 
 /**
  * @brief Broadcasts a message to all connected clients.
@@ -53,15 +67,15 @@ void send_private_message(const std::string& message, const std::string& sender_
 
     if (recipient_socket != -1) {
         // Recipient was found, format and send the private message.
-        std::string pm_to_send = "[Private from " + sender_username + "]: " + message;
+        std::string pm_to_send = get_current_time() + " [Private from " + sender_username + "]: " + message;
         write(recipient_socket, pm_to_send.c_str(), pm_to_send.length());
 
         // Send a confirmation message back to the sender.
-        std::string confirmation_msg = "[Server]: Your private message to " + recipient_username + " has been sent.\n";
+        std::string confirmation_msg = get_current_time() + " [Server]: Your private message to " + recipient_username + " has been sent.\n";
         write(sender_socket, confirmation_msg.c_str(), confirmation_msg.length());
     } else {
         // Recipient was not found.
-        std::string error_msg = "[Server]: User '" + recipient_username + "' not found or is offline.\n";
+        std::string error_msg = get_current_time() + " [Server]: User '" + recipient_username + "' not found or is offline.\n";
         write(sender_socket, error_msg.c_str(), error_msg.length());
     }
 }
@@ -133,11 +147,10 @@ void handle_client(int client_socket) {
         client_usernames[client_socket] = username;
     }
     
-    std::string join_msg = "[Server]: " + username + " has joined the chat.\n";
+    std::string join_msg = get_current_time() + " [Server]: " + username + " has joined the chat.\n";
     std::cout << join_msg;
     broadcast_message(join_msg, client_socket);
 
-    // --- NEW: Expanded welcome message with rules ---
     std::string help_msg = "\nWelcome to the C++ Chat Server, " + username + "!\n"
                            "========================================\n"
                            "Server Rules: Be respectful to others.\n\n"
@@ -145,6 +158,7 @@ void handle_client(int client_socket) {
                            "  - To send a public message, just type and press Enter.\n"
                            "  - To send a private message: /msg <username> <message>\n"
                            "  - To see who is online: /list\n"
+                           "  - To get help: /help\n"
                            "  - To leave the chat: /quit\n"
                            "========================================\n\n";
     write(client_socket, help_msg.c_str(), help_msg.length());
@@ -154,9 +168,8 @@ void handle_client(int client_socket) {
         if (received_msg == "/quit") {
             break;
         }
-        // --- NEW: Handle /list command ---
         else if (received_msg == "/list") {
-            std::string user_list_msg = "[Server]: Users currently online:\n";
+            std::string user_list_msg = get_current_time() + " [Server]: Users currently online:\n";
             {
                 std::lock_guard<std::mutex> guard(shared_resources_mutex);
                 for (auto const& pair : client_usernames) {
@@ -164,6 +177,9 @@ void handle_client(int client_socket) {
                 }
             }
             write(client_socket, user_list_msg.c_str(), user_list_msg.length());
+        }
+        else if (received_msg == "/help") {
+            write(client_socket, help_msg.c_str(), help_msg.length());
         }
         else if (received_msg.rfind("/msg", 0) == 0) {
             std::stringstream ss(received_msg);
@@ -181,17 +197,17 @@ void handle_client(int client_socket) {
             if (!recipient.empty() && !private_message.empty()) {
                 send_private_message(private_message + "\n", username, recipient, client_socket);
             } else {
-                std::string usage_msg = "[Server]: Usage: /msg <username> <message>\n";
+                std::string usage_msg = get_current_time() + " [Server]: Usage: /msg <username> <message>\n";
                 write(client_socket, usage_msg.c_str(), usage_msg.length());
             }
         } else {
-            std::string message = "[" + username + "]: " + received_msg + "\n";
+            std::string message = get_current_time() + " [" + username + "]: " + received_msg + "\n";
             std::cout << message;
             broadcast_message(message, client_socket);
         }
     }
 
-    std::string leave_msg = "[Server]: " + username + " has left the chat.\n";
+    std::string leave_msg = get_current_time() + " [Server]: " + username + " has left the chat.\n";
     std::cout << leave_msg;
     broadcast_message(leave_msg, client_socket);
 
