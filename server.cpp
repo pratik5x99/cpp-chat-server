@@ -124,6 +124,10 @@ void handle_client(int client_socket) {
         }
 
         bool name_taken = false;
+        // Convert username to lowercase for case-insensitive comparison
+        std::string lower_username = username;
+        std::transform(lower_username.begin(), lower_username.end(), lower_username.begin(), ::tolower);
+
         {
             std::lock_guard<std::mutex> guard(shared_resources_mutex);
             for (auto const& pair : client_usernames) {
@@ -136,7 +140,10 @@ void handle_client(int client_socket) {
 
         if (name_taken) {
             write(client_socket, "[Server]: Username is already taken. Please try another.\n", 55);
-        } else {
+        } else if (lower_username == "server" || lower_username == "admin") {
+            write(client_socket, "[Server]: That username is reserved. Please try another.\n", 56);
+        }
+        else {
             break;
         }
     }
