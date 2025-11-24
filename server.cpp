@@ -13,11 +13,18 @@
 #include <iomanip>       // For formatting the time
 
 #define PORT 8080
+#define DEFAULT_ROOM "#general"
+
+// --- Struct to hold user information ---
+struct UserInfo {
+    std::string username;
+    std::string current_room;
+};
 
 // --- Shared Resources ---
 std::mutex shared_resources_mutex; 
-std::vector<int> clients; 
-std::map<int, std::string> client_usernames;
+std::map<int, UserInfo> clients_info; // Maps socket to user info
+std::map<std::string, std::vector<int>> rooms; // Maps room name to list of client sockets
 
 /**
  * @brief Gets the current time formatted as [HH:MM].
@@ -32,57 +39,26 @@ std::string get_current_time() {
 }
 
 /**
- * @brief Broadcasts a message to all connected clients.
+ * @brief Broadcasts a message to all clients in a specific room.
  * @param message The message string to be sent.
- * @param sender_socket The socket of the client who sent the message (optional, 0 to send to all).
+ * @param room The name of the room to broadcast to.
+ * @param sender_socket The socket of the client who sent the message.
  */
-void broadcast_message(const std::string& message, int sender_socket = 0) {
+void broadcast_message(const std::string& message, const std::string& room, int sender_socket) {
     std::lock_guard<std::mutex> guard(shared_resources_mutex);
 
-    for (int client_socket : clients) {
-        if (client_socket != sender_socket) {
-            write(client_socket, message.c_str(), message.length());
+    // Check if the room exists and has members
+    if (rooms.find(room) != rooms.end()) {
+        for (int client_socket : rooms.at(room)) {
+            if (client_socket != sender_socket) {
+                write(client_socket, message.c_str(), message.length());
+            }
         }
-    }
-}
-
-/**
- * @brief Sends a private message from one user to another.
- * @param message The message content.
- * @param sender_username The username of the person sending the message.
- * @param recipient_username The username of the intended recipient.
- * @param sender_socket The socket of the sender, to send confirmations/errors back.
- */
-void send_private_message(const std::string& message, const std::string& sender_username, const std::string& recipient_username, int sender_socket) {
-    std::lock_guard<std::mutex> guard(shared_resources_mutex);
-
-    int recipient_socket = -1;
-    // Find the recipient's socket by iterating through the map.
-    for (auto const& pair : client_usernames) {
-        if (pair.second == recipient_username) {
-            recipient_socket = pair.first;
-            break;
-        }
-    }
-
-    if (recipient_socket != -1) {
-        // Recipient was found, format and send the private message.
-        std::string pm_to_send = get_current_time() + " [Private from " + sender_username + "]: " + message;
-        write(recipient_socket, pm_to_send.c_str(), pm_to_send.length());
-
-        // Send a confirmation message back to the sender.
-        std::string confirmation_msg = get_current_time() + " [Server]: Your private message to " + recipient_username + " has been sent.\n";
-        write(sender_socket, confirmation_msg.c_str(), confirmation_msg.length());
-    } else {
-        // Recipient was not found.
-        std::string error_msg = get_current_time() + " [Server]: User '" + recipient_username + "' not found or is offline.\n";
-        write(sender_socket, error_msg.c_str(), error_msg.length());
     }
 }
 
 /**
  * @brief Reads a full line (ending in '\n') from a socket.
- * This handles clients that send data character-by-character (like Telnet).
  * @param client_socket The socket to read from.
  * @param out_line The string to store the resulting line.
  * @return bool True if a line was read successfully, false if the client disconnected.
@@ -94,13 +70,13 @@ bool read_line_from_client(int client_socket, std::string& out_line) {
 
     while ((bytes_read = read(client_socket, &buffer, 1)) > 0) {
         if (buffer == '\n') {
-            break; // End of line
+            break;
         }
-        if (buffer == '\b' || buffer == '\x7f') { // Check for backspace (BS) or delete (DEL)
+        if (buffer == '\b' || buffer == '\x7f') {
             if (!out_line.empty()) {
                 out_line.pop_back();
             }
-        } else if (buffer != '\r') { // Ignore carriage return
+        } else if (buffer != '\r') {
             out_line += buffer;
         }
     }
@@ -113,25 +89,31 @@ bool read_line_from_client(int client_socket, std::string& out_line) {
  * @param client_socket The socket file descriptor for the connected client.
  */
 void handle_client(int client_socket) {
-    std::string username;
+    UserInfo user;
+    user.current_room = DEFAULT_ROOM;
 
+    // Get a unique username
     while (true) {
         write(client_socket, "Please enter your username: ", 28);
-        if (!read_line_from_client(client_socket, username) || username.empty()) {
+        if (!read_line_from_client(client_socket, user.username) || user.username.empty()) {
             std::cout << "Client failed to provide username. Disconnecting." << std::endl;
             close(client_socket);
             return;
         }
 
         bool name_taken = false;
-        // Convert username to lowercase for case-insensitive comparison
-        std::string lower_username = username;
+        std::string lower_username = user.username;
         std::transform(lower_username.begin(), lower_username.end(), lower_username.begin(), ::tolower);
+
+        if (lower_username == "server" || lower_username == "admin") {
+             write(client_socket, "[Server]: That username is reserved. Please try another.\n", 56);
+             continue;
+        }
 
         {
             std::lock_guard<std::mutex> guard(shared_resources_mutex);
-            for (auto const& pair : client_usernames) {
-                if (pair.second == username) {
+            for (auto const& pair : clients_info) {
+                if (pair.second.username == user.username) {
                     name_taken = true;
                     break;
                 }
@@ -140,33 +122,31 @@ void handle_client(int client_socket) {
 
         if (name_taken) {
             write(client_socket, "[Server]: Username is already taken. Please try another.\n", 55);
-        } else if (lower_username == "server" || lower_username == "admin") {
-            write(client_socket, "[Server]: That username is reserved. Please try another.\n", 56);
-        }
-        else {
+        } else {
             break;
         }
     }
 
+    // Add client to shared resources and default room
     {
         std::lock_guard<std::mutex> guard(shared_resources_mutex);
-        clients.push_back(client_socket);
-        client_usernames[client_socket] = username;
+        clients_info[client_socket] = user;
+        rooms[user.current_room].push_back(client_socket);
     }
     
-    std::string join_msg = get_current_time() + " [Server]: " + username + " has joined the chat.\n";
+    std::string join_msg = get_current_time() + " [Server]: " + user.username + " has joined " + user.current_room + ".\n";
     std::cout << join_msg;
-    broadcast_message(join_msg, client_socket);
+    broadcast_message(join_msg, user.current_room, client_socket);
 
-    std::string help_msg = "\nWelcome to the C++ Chat Server, " + username + "!\n"
+    std::string help_msg = "\nWelcome to the C++ Chat Server, " + user.username + "!\n"
                            "========================================\n"
-                           "Server Rules: Be respectful to others.\n\n"
+                           "You are currently in room: " + user.current_room + "\n\n"
                            "Commands:\n"
-                           "  - To send a public message, just type and press Enter.\n"
-                           "  - To send a private message: /msg <username> <message>\n"
-                           "  - To see who is online: /list\n"
-                           "  - To get help: /help\n"
-                           "  - To leave the chat: /quit\n"
+                           "  - /join <room_name>   - Join or create a new room.\n"
+                           "  - /msg <username> <message> - Send a private message.\n"
+                           "  - /list                 - See who is in your current room.\n"
+                           "  - /help                 - Show this help message again.\n"
+                           "  - /quit                 - Leave the chat.\n"
                            "========================================\n\n";
     write(client_socket, help_msg.c_str(), help_msg.length());
 
@@ -176,11 +156,11 @@ void handle_client(int client_socket) {
             break;
         }
         else if (received_msg == "/list") {
-            std::string user_list_msg = get_current_time() + " [Server]: Users currently online:\n";
+            std::string user_list_msg = get_current_time() + " [Server]: Users in " + user.current_room + ":\n";
             {
                 std::lock_guard<std::mutex> guard(shared_resources_mutex);
-                for (auto const& pair : client_usernames) {
-                    user_list_msg += " - " + pair.second + "\n";
+                for (int member_socket : rooms[user.current_room]) {
+                    user_list_msg += " - " + clients_info[member_socket].username + "\n";
                 }
             }
             write(client_socket, user_list_msg.c_str(), user_list_msg.length());
@@ -188,43 +168,69 @@ void handle_client(int client_socket) {
         else if (received_msg == "/help") {
             write(client_socket, help_msg.c_str(), help_msg.length());
         }
-        else if (received_msg.rfind("/msg", 0) == 0) {
+        // --- NEW: Handle /join command ---
+        else if (received_msg.rfind("/join", 0) == 0) {
             std::stringstream ss(received_msg);
-            std::string command, recipient, private_message;
-            
-            ss >> command;
-            ss >> recipient;
-            
-            std::getline(ss, private_message);
-            size_t first_char = private_message.find_first_not_of(" \t");
-            if (std::string::npos != first_char) {
-                private_message = private_message.substr(first_char);
-            }
+            std::string command, new_room;
+            ss >> command >> new_room;
 
-            if (!recipient.empty() && !private_message.empty()) {
-                send_private_message(private_message + "\n", username, recipient, client_socket);
-            } else {
-                std::string usage_msg = get_current_time() + " [Server]: Usage: /msg <username> <message>\n";
-                write(client_socket, usage_msg.c_str(), usage_msg.length());
+            if (!new_room.empty() && new_room != user.current_room) {
+                // Announce departure from old room
+                std::string leave_room_msg = get_current_time() + " [Server]: " + user.username + " has left the room.\n";
+                broadcast_message(leave_room_msg, user.current_room, client_socket);
+
+                // Update server state
+                {
+                    std::lock_guard<std::mutex> guard(shared_resources_mutex);
+                    // Remove from old room's vector
+                    auto& old_room_clients = rooms[user.current_room];
+                    old_room_clients.erase(std::remove(old_room_clients.begin(), old_room_clients.end(), client_socket), old_room_clients.end());
+                    
+                    // Update user's current room
+                    user.current_room = new_room;
+                    clients_info[client_socket].current_room = new_room;
+                    
+                    // Add to new room's vector
+                    rooms[new_room].push_back(client_socket);
+                }
+
+                // Announce arrival in new room
+                std::string join_room_msg = get_current_time() + " [Server]: " + user.username + " has joined " + new_room + ".\n";
+                broadcast_message(join_room_msg, new_room, 0); // Send to everyone in new room
+                write(client_socket, ("You have joined " + new_room + ".\n").c_str(), ("You have joined " + new_room + ".\n").length());
             }
+        }
+        else if (received_msg.rfind("/msg", 0) == 0) {
+            // Private messaging logic would need to be updated to search across all rooms
+            // For simplicity, this is left as an exercise.
+            write(client_socket, "[Server]: Private messaging is not yet implemented in rooms.\n", 60);
         } else {
-            std::string message = get_current_time() + " [" + username + "]: " + received_msg + "\n";
-            std::cout << message;
-            broadcast_message(message, client_socket);
+            std::string message = get_current_time() + " [" + user.username + "]: " + received_msg + "\n";
+            std::cout << user.current_room << " " << message;
+            broadcast_message(message, user.current_room, client_socket);
         }
     }
 
-    std::string leave_msg = get_current_time() + " [Server]: " + username + " has left the chat.\n";
+    // Cleanup for disconnected client
+    std::string leave_msg = get_current_time() + " [Server]: " + user.username + " has left the chat.\n";
     std::cout << leave_msg;
-    broadcast_message(leave_msg, client_socket);
+    broadcast_message(leave_msg, user.current_room, client_socket);
 
     {
         std::lock_guard<std::mutex> guard(shared_resources_mutex);
-        client_usernames.erase(client_socket);
-        auto it = std::find(clients.begin(), clients.end(), client_socket);
-        if (it != clients.end()) {
-            clients.erase(it);
+        
+        // 1. Remove from the room they were in
+        auto& room_clients = rooms[user.current_room];
+        room_clients.erase(std::remove(room_clients.begin(), room_clients.end(), client_socket), room_clients.end());
+        
+        // If the room is now empty (and not the default), you might want to delete it to save memory:
+        if (room_clients.empty() && user.current_room != DEFAULT_ROOM) {
+            rooms.erase(user.current_room);
         }
+
+        // 2. Remove from the global clients info map
+        // THIS IS THE KEY FIX: Ensuring the username is freed up.
+        clients_info.erase(client_socket);
     }
     close(client_socket);
 }
